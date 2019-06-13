@@ -3,18 +3,21 @@ pub mod signals;
 
 pub use crate::instance::signals::{signal_handler_none, SignalBehavior, SignalHandler};
 
-use crate::alloc::Alloc;
+use crate::alloc::{Alloc, HOST_PAGE_SIZE_EXPECTED};
 use crate::context::Context;
 use crate::embed_ctx::CtxMap;
 use crate::error::Error;
 use crate::instance::siginfo_ext::SiginfoExt;
 use crate::module::{self, Global, Module};
-use crate::trapcode::{TrapCode, TrapCodeType};
+use crate::region::RegionInternal;
+use crate::sysdeps::UContext;
 use crate::val::{UntypedRetVal, Val};
 use crate::WASM_PAGE_SIZE;
 use libc::{c_void, siginfo_t, uintptr_t, SIGBUS, SIGSEGV};
+use lucet_module_data::{FunctionHandle, FunctionPointer, GlobalValue, TrapCode};
+use memoffset::offset_of;
 use std::any::Any;
-use std::cell::{RefCell, UnsafeCell};
+use std::cell::{BorrowError, BorrowMutError, Ref, RefCell, RefMut, UnsafeCell};
 use std::ffi::{CStr, CString};
 use std::mem;
 use std::ops::{Deref, DerefMut};
@@ -22,7 +25,6 @@ use std::ptr::{self, NonNull};
 use std::sync::Arc;
 
 pub const LUCET_INSTANCE_MAGIC: u64 = 746932922;
-pub const INSTANCE_PADDING: usize = 2328;
 
 thread_local! {
     /// The host context.
@@ -53,7 +55,11 @@ thread_local! {
 /// though it were a `&mut Instance`.
 pub struct InstanceHandle {
     inst: NonNull<Instance>,
+    needs_inst_drop: bool,
 }
+
+// raw pointer lint
+unsafe impl Send for InstanceHandle {}
 
 /// Create a new `InstanceHandle`.
 ///
@@ -73,13 +79,15 @@ pub fn new_instance_handle(
     let inst = NonNull::new(instance)
         .ok_or(lucet_format_err!("instance pointer is null; this is a bug"))?;
 
-    // do this check first so we don't run `InstanceHandle::drop()` for a failure
     lucet_ensure!(
         unsafe { inst.as_ref().magic } != LUCET_INSTANCE_MAGIC,
         "created a new instance handle in memory with existing instance magic; this is a bug"
     );
 
-    let mut handle = InstanceHandle { inst };
+    let mut handle = InstanceHandle {
+        inst,
+        needs_inst_drop: false,
+    };
 
     let inst = Instance::new(alloc, module, embed_ctx);
 
@@ -92,20 +100,25 @@ pub fn new_instance_handle(
         ptr::write(&mut *handle, inst);
     };
 
+    handle.needs_inst_drop = true;
+
     handle.reset()?;
 
     Ok(handle)
 }
 
-pub fn instance_handle_to_raw(inst: InstanceHandle) -> *mut Instance {
-    let ptr = inst.inst.as_ptr();
-    std::mem::forget(inst);
-    ptr
+pub fn instance_handle_to_raw(mut inst: InstanceHandle) -> *mut Instance {
+    inst.needs_inst_drop = false;
+    inst.inst.as_ptr()
 }
 
-pub unsafe fn instance_handle_from_raw(ptr: *mut Instance) -> InstanceHandle {
+pub unsafe fn instance_handle_from_raw(
+    ptr: *mut Instance,
+    needs_inst_drop: bool,
+) -> InstanceHandle {
     InstanceHandle {
         inst: NonNull::new_unchecked(ptr),
+        needs_inst_drop,
     }
 }
 
@@ -128,11 +141,25 @@ impl DerefMut for InstanceHandle {
 
 impl Drop for InstanceHandle {
     fn drop(&mut self) {
-        // eprintln!("InstanceHandle::drop()");
-        // zero out magic, then run the destructor by taking and dropping the inner `Instance`
-        self.magic = 0;
-        unsafe {
-            mem::replace(self.inst.as_mut(), mem::uninitialized());
+        if self.needs_inst_drop {
+            unsafe {
+                let inst = self.inst.as_mut();
+
+                // Grab a handle to the region to ensure it outlives `inst`.
+                //
+                // This ensures that the region won't be dropped by `inst` being
+                // dropped, which could result in `inst` being unmapped by the
+                // Region *during* drop of the Instance's fields.
+                let region: Arc<dyn RegionInternal> = inst.alloc().region.clone();
+
+                // drop the actual instance
+                std::ptr::drop_in_place(inst);
+
+                // and now we can drop what may be the last Arc<Region>. If it is
+                // it can safely do what it needs with memory; we're not running
+                // destructors on it anymore.
+                mem::drop(region);
+            }
         }
     }
 }
@@ -148,6 +175,7 @@ impl Drop for InstanceHandle {
 /// and their fields are never moved in memory, otherwise raw pointers in the metadata could be
 /// unsafely invalidated.
 #[repr(C)]
+#[repr(align(4096))]
 pub struct Instance {
     /// Used to catch bugs in pointer math used to find the address of the instance
     magic: u64,
@@ -179,7 +207,7 @@ pub struct Instance {
     signal_handler: Box<
         dyn Fn(
             &Instance,
-            &TrapCode,
+            &Option<TrapCode>,
             libc::c_int,
             *const siginfo_t,
             *const c_void,
@@ -187,16 +215,27 @@ pub struct Instance {
     >,
 
     /// Pointer to the function used as the entrypoint (for use in backtraces)
-    entrypoint: *const extern "C" fn(),
+    entrypoint: Option<FunctionPointer>,
 
-    /// Padding to ensure the pointer to globals at the end of the page occupied by the `Instance`
-    _reserved: [u8; INSTANCE_PADDING],
+    /// `_padding` must be the last member of the structure.
+    /// This marks where the padding starts to make the structure exactly 4096 bytes long.
+    /// It is also used to compute the size of the structure up to that point, i.e. without padding.
+    _padding: (),
+}
 
-    /// Pointer to the globals
-    ///
-    /// This is accessed through the `vmctx` pointer, which points to the heap that begins
-    /// immediately after this struct, so it has to come at the very end.
-    globals_ptr: *const i64,
+/// Users of `Instance` must be very careful about when instances are dropped!
+///
+/// Typically you will not have to worry about this, as InstanceHandle will robustly handle
+/// Instance drop semantics. If an instance is dropped, and the Region it's in has already dropped,
+/// it may contain the last reference counted pointer to its Region. If so, when Instance's
+/// destructor runs, Region will be dropped, and may free or otherwise invalidate the memory that
+/// this Instance exists in, *while* the Instance destructor is executing.
+impl Drop for Instance {
+    fn drop(&mut self) {
+        // Reset magic to indicate this instance
+        // is no longer valid
+        self.magic = 0;
+    }
 }
 
 /// APIs that are internal, but useful to implementors of extension modules; you probably don't want
@@ -247,11 +286,11 @@ impl Instance {
     /// # use lucet_runtime_internals::instance::InstanceHandle;
     /// # let instance: InstanceHandle = unimplemented!();
     /// // regular execution yields `Ok(UntypedRetVal)`
-    /// let retval = instance.run(b"factorial", &[5u64.into()]).unwrap();
+    /// let retval = instance.run("factorial", &[5u64.into()]).unwrap();
     /// assert_eq!(u64::from(retval), 120u64);
     ///
     /// // runtime faults yield `Err(Error)`
-    /// let result = instance.run(b"faulting_function", &[]);
+    /// let result = instance.run("faulting_function", &[]);
     /// assert!(result.is_err());
     /// ```
     ///
@@ -271,7 +310,7 @@ impl Instance {
     ///
     /// For the moment, we do not mark this as `unsafe` in the Rust type system, but that may change
     /// in the future.
-    pub fn run(&mut self, entrypoint: &[u8], args: &[Val]) -> Result<UntypedRetVal, Error> {
+    pub fn run(&mut self, entrypoint: &str, args: &[Val]) -> Result<UntypedRetVal, Error> {
         let func = self.module.get_export_func(entrypoint)?;
         self.run_func(func, &args)
     }
@@ -315,7 +354,7 @@ impl Instance {
                         i
                     )));
                 }
-                Global::Def { def } => def.init_val(),
+                Global::Def(def) => def.init_val(),
             };
         }
 
@@ -332,9 +371,15 @@ impl Instance {
     ///
     /// On success, returns the number of pages that existed before the call.
     pub fn grow_memory(&mut self, additional_pages: u32) -> Result<u32, Error> {
+        let additional_bytes =
+            additional_pages
+                .checked_mul(WASM_PAGE_SIZE)
+                .ok_or(lucet_format_err!(
+                    "additional pages larger than wasm address space",
+                ))?;
         let orig_len = self
             .alloc
-            .expand_heap(additional_pages * WASM_PAGE_SIZE, self.module.as_ref())?;
+            .expand_heap(additional_bytes, self.module.as_ref())?;
         Ok(orig_len / WASM_PAGE_SIZE)
     }
 
@@ -359,12 +404,12 @@ impl Instance {
     }
 
     /// Return the WebAssembly globals as a slice of `i64`s.
-    pub fn globals(&self) -> &[i64] {
+    pub fn globals(&self) -> &[GlobalValue] {
         unsafe { self.alloc.globals() }
     }
 
     /// Return the WebAssembly globals as a mutable slice of `i64`s.
-    pub fn globals_mut(&mut self) -> &mut [i64] {
+    pub fn globals_mut(&mut self) -> &mut [GlobalValue] {
         unsafe { self.alloc.globals_mut() }
     }
 
@@ -380,13 +425,13 @@ impl Instance {
     }
 
     /// Get a reference to a context value of a particular type, if it exists.
-    pub fn get_embed_ctx<T: Any>(&self) -> Option<&T> {
-        self.embed_ctx.get::<T>()
+    pub fn get_embed_ctx<T: Any>(&self) -> Option<Result<Ref<T>, BorrowError>> {
+        self.embed_ctx.try_get::<T>()
     }
 
     /// Get a mutable reference to a context value of a particular type, if it exists.
-    pub fn get_embed_ctx_mut<T: Any>(&mut self) -> Option<&mut T> {
-        self.embed_ctx.get_mut::<T>()
+    pub fn get_embed_ctx_mut<T: Any>(&mut self) -> Option<Result<RefMut<T>, BorrowMutError>> {
+        self.embed_ctx.try_get_mut::<T>()
     }
 
     /// Insert a context value.
@@ -421,7 +466,13 @@ impl Instance {
     pub fn set_signal_handler<H>(&mut self, handler: H)
     where
         H: 'static
-            + Fn(&Instance, &TrapCode, libc::c_int, *const siginfo_t, *const c_void) -> SignalBehavior,
+            + Fn(
+                &Instance,
+                &Option<TrapCode>,
+                libc::c_int,
+                *const siginfo_t,
+                *const c_void,
+            ) -> SignalBehavior,
     {
         self.signal_handler = Box::new(handler) as Box<SignalHandler>;
     }
@@ -454,7 +505,7 @@ impl Instance {
 impl Instance {
     fn new(alloc: Alloc, module: Arc<dyn Module>, embed_ctx: CtxMap) -> Self {
         let globals_ptr = alloc.slot().globals as *mut i64;
-        Instance {
+        let mut inst = Instance {
             magic: LUCET_INSTANCE_MAGIC,
             embed_ctx: embed_ctx,
             module,
@@ -466,28 +517,71 @@ impl Instance {
             fatal_handler: default_fatal_handler,
             c_fatal_handler: None,
             signal_handler: Box::new(signal_handler_none) as Box<SignalHandler>,
-            entrypoint: ptr::null(),
-            _reserved: [0; INSTANCE_PADDING],
-            globals_ptr,
+            entrypoint: None,
+            _padding: (),
+        };
+        inst.set_globals_ptr(globals_ptr);
+
+        assert_eq!(mem::size_of::<Instance>(), HOST_PAGE_SIZE_EXPECTED);
+        let unpadded_size = offset_of!(Instance, _padding);
+        assert!(unpadded_size <= HOST_PAGE_SIZE_EXPECTED - mem::size_of::<*mut i64>());
+        inst
+    }
+
+    // The globals pointer must be stored right before the end of the structure, padded to the page size,
+    // so that it is 8 bytes before the heap.
+    // For this reason, the alignment of the structure is set to 4096, and we define accessors that
+    // read/write the globals pointer as bytes [4096-8..4096] of that structure represented as raw bytes.
+    #[inline]
+    pub fn get_globals_ptr(&self) -> *const i64 {
+        unsafe {
+            *((self as *const _ as *const u8)
+                .offset((HOST_PAGE_SIZE_EXPECTED - mem::size_of::<*mut i64>()) as isize)
+                as *const *const i64)
+        }
+    }
+
+    #[inline]
+    pub fn set_globals_ptr(&mut self, globals_ptr: *const i64) {
+        unsafe {
+            *((self as *mut _ as *mut u8)
+                .offset((HOST_PAGE_SIZE_EXPECTED - mem::size_of::<*mut i64>()) as isize)
+                as *mut *const i64) = globals_ptr;
         }
     }
 
     /// Run a function in guest context at the given entrypoint.
-    fn run_func(
-        &mut self,
-        func: *const extern "C" fn(),
-        args: &[Val],
-    ) -> Result<UntypedRetVal, Error> {
+    fn run_func(&mut self, func: FunctionHandle, args: &[Val]) -> Result<UntypedRetVal, Error> {
         lucet_ensure!(
-            self.state.is_ready(),
-            "instance must be ready; this is a bug"
+            self.state.is_ready() || (self.state.is_fault() && !self.state.is_fatal()),
+            "instance must be ready or non-fatally faulted"
         );
-        if func.is_null() {
+        if func.ptr.as_usize() == 0 {
             return Err(Error::InvalidArgument(
                 "entrypoint function cannot be null; this is probably a malformed module",
             ));
         }
-        self.entrypoint = func;
+
+        let sig = self.module.get_signature(func.id);
+
+        // in typechecking these values, we can only really check that arguments are correct.
+        // in the future we might want to make return value use more type safe as well.
+
+        if sig.params.len() != args.len() {
+            return Err(Error::InvalidArgument(
+                "entrypoint function signature mismatch (number of arguments is incorrect)",
+            ));
+        }
+
+        for (param_ty, arg) in sig.params.iter().zip(args.iter()) {
+            if param_ty != &arg.value_type() {
+                return Err(Error::InvalidArgument(
+                    "entrypoint function signature mismatch",
+                ));
+            }
+        }
+
+        self.entrypoint = Some(func.ptr);
 
         let mut args_with_vmctx = vec![Val::from(self.alloc.slot().heap)];
         args_with_vmctx.extend_from_slice(args);
@@ -497,7 +591,7 @@ impl Instance {
                 unsafe { self.alloc.stack_u64_mut() },
                 unsafe { &mut *host_ctx.get() },
                 &mut self.ctx,
-                func,
+                func.ptr,
                 &args_with_vmctx,
             )
         })?;
@@ -585,28 +679,17 @@ impl Instance {
             details:
                 FaultDetails {
                     rip_addr,
-                    trapcode,
-                    ref mut fatal,
                     ref mut rip_addr_details,
                     ..
                 },
-            siginfo,
             ..
         } = self.state
         {
             // We do this after returning from the signal handler because it requires `dladdr`
             // calls, which are not signal safe
+            // FIXME after lucet-module is complete it should be possible to fill this in without
+            // consulting the process symbol table
             *rip_addr_details = self.module.addr_details(rip_addr as *const c_void)?.clone();
-
-            // If the trap table lookup returned unknown, it is a fatal error
-            let unknown_fault = trapcode.ty == TrapCodeType::Unknown;
-
-            // If the trap was a segv or bus fault and the addressed memory was outside the
-            // guard pages, it is also a fatal error
-            let outside_guard = (siginfo.si_signo == SIGSEGV || siginfo.si_signo == SIGBUS)
-                && !self.alloc.addr_in_heap_guard(siginfo.si_addr());
-
-            *fatal = unknown_fault || outside_guard;
         }
         Ok(())
     }
@@ -620,7 +703,7 @@ pub enum State {
     Fault {
         details: FaultDetails,
         siginfo: libc::siginfo_t,
-        context: libc::ucontext_t,
+        context: UContext,
     },
     Terminated {
         details: TerminationDetails,
@@ -636,7 +719,7 @@ pub struct FaultDetails {
     /// If true, the instance's `fatal_handler` will be called.
     pub fatal: bool,
     /// Information about the type of fault that occurred.
-    pub trapcode: TrapCode,
+    pub trapcode: Option<TrapCode>,
     /// The instruction pointer where the fault occurred.
     pub rip_addr: uintptr_t,
     /// Extra information about the instruction pointer's location, if available.
@@ -651,7 +734,11 @@ impl std::fmt::Display for FaultDetails {
             write!(f, "fault ")?;
         }
 
-        self.trapcode.fmt(f)?;
+        if let Some(trapcode) = self.trapcode {
+            write!(f, "{:?} ", trapcode)?;
+        } else {
+            write!(f, "TrapCode::UNKNOWN ")?;
+        }
 
         write!(f, "code at address {:p}", self.rip_addr as *const c_void)?;
 
@@ -682,15 +769,18 @@ impl std::fmt::Display for FaultDetails {
 /// error has occurred in a hostcall, rather than in WebAssembly code.
 #[derive(Clone)]
 pub enum TerminationDetails {
+    /// Returned when a signal handler terminates the instance.
     Signal,
-    GetEmbedCtx,
-    /// Calls to `Vmctx::terminate()` may attach an arbitrary pointer for extra debugging
-    /// information.
-    Provided(Arc<dyn Any>),
+    /// Returned when `get_embed_ctx` or `get_embed_ctx_mut` are used with a type that is not present.
+    CtxNotFound,
+    /// Returned when dynamic borrowing rules of methods like `Vmctx::heap()` are violated.
+    BorrowError(&'static str),
+    /// Calls to `lucet_hostcall_terminate` provide a payload for use by the embedder.
+    Provided(Arc<dyn Any + 'static + Send + Sync>),
 }
 
 impl TerminationDetails {
-    pub fn provide<A: Any>(details: A) -> Self {
+    pub fn provide<A: Any + 'static + Send + Sync>(details: A) -> Self {
         TerminationDetails::Provided(Arc::new(details))
     }
     pub fn provided_details(&self) -> Option<&dyn Any> {
@@ -714,17 +804,28 @@ fn termination_details_any_typing() {
     );
 }
 
+impl PartialEq for TerminationDetails {
+    fn eq(&self, rhs: &TerminationDetails) -> bool {
+        use TerminationDetails::*;
+        match (self, rhs) {
+            (Signal, Signal) => true,
+            (BorrowError(msg1), BorrowError(msg2)) => msg1 == msg2,
+            (CtxNotFound, CtxNotFound) => true,
+            // can't compare `Any`
+            _ => false,
+        }
+    }
+}
+
 impl std::fmt::Debug for TerminationDetails {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        write!(
-            f,
-            "TerminationDetails::{}",
-            match self {
-                TerminationDetails::Signal => "Signal",
-                TerminationDetails::GetEmbedCtx => "GetEmbedCtx",
-                TerminationDetails::Provided(_) => "Provided(Any)",
-            }
-        )
+        write!(f, "TerminationDetails::")?;
+        match self {
+            TerminationDetails::Signal => write!(f, "Signal"),
+            TerminationDetails::BorrowError(msg) => write!(f, "BorrowError({})", msg),
+            TerminationDetails::CtxNotFound => write!(f, "CtxNotFound"),
+            TerminationDetails::Provided(_) => write!(f, "Provided(Any)"),
+        }
     }
 }
 
@@ -754,7 +855,7 @@ impl std::fmt::Display for State {
                     write!(
                         f,
                         " accessed memory at {:p} (inside heap guard)",
-                        siginfo.si_addr()
+                        siginfo.si_addr_ext()
                     )?;
                 }
                 Ok(())
@@ -823,26 +924,4 @@ extern "C" {
 // TODO: PR into `nix`
 fn strsignal_wrapper(sig: libc::c_int) -> CString {
     unsafe { CStr::from_ptr(strsignal(sig)).to_owned() }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use memoffset::offset_of;
-
-    #[test]
-    fn instance_size_correct() {
-        assert_eq!(mem::size_of::<Instance>(), 4096);
-    }
-
-    #[test]
-    fn instance_globals_offset_correct() {
-        let offset = offset_of!(Instance, globals_ptr) as isize;
-        if offset != 4096 - 8 {
-            let diff = 4096 - 8 - offset;
-            let new_padding = INSTANCE_PADDING as isize + diff;
-            panic!("new padding should be: {:?}", new_padding);
-        }
-        assert_eq!(offset_of!(Instance, globals_ptr), 4096 - 8);
-    }
 }

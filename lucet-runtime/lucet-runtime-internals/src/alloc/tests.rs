@@ -2,6 +2,7 @@
 macro_rules! alloc_tests {
     ( $TestRegion:path ) => {
         use libc::c_void;
+        use lucet_module_data::{FunctionPointer, GlobalValue};
         use std::sync::Arc;
         use $TestRegion as TestRegion;
         use $crate::alloc::Limits;
@@ -256,6 +257,19 @@ macro_rules! alloc_tests {
             assert!(res.is_err(), "new_instance fails");
         }
 
+        /// This test shows that we reject limits with a larger memory size than address space size
+        #[test]
+        fn reject_undersized_address_space() {
+            const LIMITS: Limits = Limits {
+                heap_memory_size: LIMITS_HEAP_ADDRSPACE_SIZE + 4096,
+                heap_address_space_size: LIMITS_HEAP_ADDRSPACE_SIZE,
+                stack_size: LIMITS_STACK_SIZE,
+                globals_size: LIMITS_GLOBALS_SIZE,
+            };
+            let res = TestRegion::create(10, &LIMITS);
+            assert!(res.is_err(), "region creation fails");
+        }
+
         const SMALL_GUARD_HEAP: HeapSpec = HeapSpec {
             reserved_size: SPEC_HEAP_RESERVED_SIZE,
             guard_size: SPEC_HEAP_GUARD_SIZE - 1,
@@ -335,15 +349,22 @@ macro_rules! alloc_tests {
                 assert_eq!(stack[LIMITS_STACK_SIZE - 1], 0xFF);
 
                 let globals = unsafe { inst.alloc_mut().globals_mut() };
-                assert_eq!(globals.len(), LIMITS_GLOBALS_SIZE / 8);
+                assert_eq!(
+                    globals.len(),
+                    LIMITS_GLOBALS_SIZE / std::mem::size_of::<GlobalValue>()
+                );
 
-                assert_eq!(globals[0], 0);
-                globals[0] = 0xFF;
-                assert_eq!(globals[0], 0xFF);
+                unsafe {
+                    assert_eq!(globals[0].i_64, 0);
+                    globals[0].i_64 = 0xFF;
+                    assert_eq!(globals[0].i_64, 0xFF);
+                }
 
-                assert_eq!(globals[globals.len() - 1], 0);
-                globals[globals.len() - 1] = 0xFF;
-                assert_eq!(globals[globals.len() - 1], 0xFF);
+                unsafe {
+                    assert_eq!(globals[globals.len() - 1].i_64, 0);
+                    globals[globals.len() - 1].i_64 = 0xFF;
+                    assert_eq!(globals[globals.len() - 1].i_64, 0xFF);
+                }
 
                 let sigstack = unsafe { inst.alloc_mut().sigstack_mut() };
                 assert_eq!(sigstack.len(), libc::SIGSTKSZ);
@@ -364,10 +385,55 @@ macro_rules! alloc_tests {
             peek_n_poke(&region);
         }
 
-        /// This test shows that the reset method clears the heap and restores it to the spec
-        /// initial size.
+        /// This test shows that the reset method clears the heap and resets its protections.
         #[test]
         fn alloc_reset() {
+            let region = TestRegion::create(1, &LIMITS).expect("region created");
+            let module = MockModuleBuilder::new()
+                .with_heap_spec(THREE_PAGE_MAX_HEAP)
+                .build();
+            let mut inst = region
+                .new_instance(module.clone())
+                .expect("new_instance succeeds");
+
+            let heap_len = inst.alloc().heap_len();
+            assert_eq!(heap_len, THREEPAGE_INITIAL_SIZE as usize);
+
+            let heap = unsafe { inst.alloc_mut().heap_mut() };
+
+            assert_eq!(heap[0], 0);
+            heap[0] = 0xFF;
+            assert_eq!(heap[0], 0xFF);
+
+            assert_eq!(heap[heap_len - 1], 0);
+            heap[heap_len - 1] = 0xFF;
+            assert_eq!(heap[heap_len - 1], 0xFF);
+
+            // Making a new mock module here because the borrow checker doesn't like referencing
+            // `inst.module` while `inst.alloc()` is borrowed mutably. The `Instance` tests don't have
+            // this weirdness
+            inst.alloc_mut()
+                .reset_heap(module.as_ref())
+                .expect("reset succeeds");
+
+            let reset_heap_len = inst.alloc().heap_len();
+            assert_eq!(reset_heap_len, THREEPAGE_INITIAL_SIZE as usize);
+
+            let heap = unsafe { inst.alloc_mut().heap_mut() };
+
+            assert_eq!(heap[0], 0);
+            heap[0] = 0xFF;
+            assert_eq!(heap[0], 0xFF);
+
+            assert_eq!(heap[reset_heap_len - 1], 0);
+            heap[reset_heap_len - 1] = 0xFF;
+            assert_eq!(heap[reset_heap_len - 1], 0xFF);
+        }
+
+        /// This test shows that the reset method clears the heap and restores it to the spec
+        /// initial size after growing the heap.
+        #[test]
+        fn alloc_grow_reset() {
             let region = TestRegion::create(1, &LIMITS).expect("region created");
             let module = MockModuleBuilder::new()
                 .with_heap_spec(THREE_PAGE_MAX_HEAP)
@@ -540,7 +606,7 @@ macro_rules! alloc_tests {
                 let child = ContextHandle::create_and_init(
                     inst.alloc_mut().stack_u64_mut(),
                     &mut parent,
-                    heap_touching_child as *const extern "C" fn(),
+                    FunctionPointer::from_usize(heap_touching_child as usize),
                     &[Val::CPtr(heap_ptr)],
                 )
                 .expect("context init succeeds");
@@ -582,7 +648,7 @@ macro_rules! alloc_tests {
                 let child = ContextHandle::create_and_init(
                     inst.alloc_mut().stack_u64_mut(),
                     &mut parent,
-                    stack_pattern_child as *const extern "C" fn(),
+                    FunctionPointer::from_usize(stack_pattern_child as usize),
                     &[Val::CPtr(heap_ptr)],
                 )
                 .expect("context init succeeds");
@@ -599,6 +665,16 @@ macro_rules! alloc_tests {
                     assert_eq!(stack_pattern[i], (i % 256) as u8);
                 }
             }
+        }
+
+        #[test]
+        fn drop_region_first() {
+            let region = TestRegion::create(1, &Limits::default()).expect("region can be created");
+            let inst = region
+                .new_instance(MockModuleBuilder::new().build())
+                .expect("new_instance succeeds");
+            drop(region);
+            drop(inst);
         }
     };
 }

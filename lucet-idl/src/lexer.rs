@@ -23,10 +23,9 @@ pub enum Token<'a> {
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum Keyword {
-    Struct,      // 'struct'
-    TaggedUnion, // 'taggedunion'
-    Enum,        // 'enum'
-    Type,        // 'type'
+    Struct, // 'struct'
+    Enum,   // 'enum'
+    Type,   // 'type'
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -35,7 +34,7 @@ pub struct LocatedToken<'a> {
     pub location: Location,
 }
 
-fn token(token: Token, location: Location) -> Result<LocatedToken, LocatedError> {
+fn token(token: Token<'_>, location: Location) -> Result<LocatedToken<'_>, LocatedError> {
     Ok(LocatedToken { token, location })
 }
 
@@ -67,7 +66,7 @@ pub struct Lexer<'a> {
 }
 
 impl<'a> Lexer<'a> {
-    pub fn new(s: &'a str) -> Lexer {
+    pub fn new(s: &'a str) -> Lexer<'_> {
         let mut lex = Lexer {
             source: s,
             chars: s.char_indices(),
@@ -145,7 +144,6 @@ impl<'a> Lexer<'a> {
         token(
             match text {
                 "struct" => Token::Keyword(Keyword::Struct),
-                "taggedunion" => Token::Keyword(Keyword::TaggedUnion),
                 "enum" => Token::Keyword(Keyword::Enum),
                 "type" => Token::Keyword(Keyword::Type),
                 "i8" => Token::Atom(AtomType::I8),
@@ -207,6 +205,7 @@ impl<'a> Lexer<'a> {
         token(Token::Quote(text), loc)
     }
 
+    #[allow(clippy::should_implement_trait)]
     pub fn next(&mut self) -> Option<Result<LocatedToken<'a>, LocatedError>> {
         loop {
             let loc = self.loc();
@@ -260,10 +259,10 @@ mod tests {
     use super::*;
 
     fn token(
-        token: Token,
+        token: Token<'_>,
         line: usize,
         column: usize,
-    ) -> Option<Result<LocatedToken, LocatedError>> {
+    ) -> Option<Result<LocatedToken<'_>, LocatedError>> {
         Some(super::token(token, Location { line, column }))
     }
 
@@ -293,12 +292,8 @@ mod tests {
 
     #[test]
     fn keywords() {
-        let mut lex = Lexer::new("struct\ntaggedunion\nenum type");
+        let mut lex = Lexer::new("struct\n\nenum type");
         assert_eq!(lex.next(), token(Token::Keyword(Keyword::Struct), 1, 0));
-        assert_eq!(
-            lex.next(),
-            token(Token::Keyword(Keyword::TaggedUnion), 2, 0)
-        );
         assert_eq!(lex.next(), token(Token::Keyword(Keyword::Enum), 3, 0));
         assert_eq!(lex.next(), token(Token::Keyword(Keyword::Type), 3, 5));
         assert_eq!(lex.next(), None);

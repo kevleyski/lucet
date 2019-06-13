@@ -1,20 +1,20 @@
+use crate::error::LucetcErrorKind;
 use failure::*;
-use parity_wasm::deserialize_buffer;
-pub use parity_wasm::elements::Module;
 use std::fs::File;
 use std::io::Read;
 use std::path::Path;
 use wabt::wat2wasm;
 
-pub fn read_module<P: AsRef<Path>>(path: P) -> Result<Module, Error> {
+pub fn read_module<P: AsRef<Path>>(path: P) -> Result<Vec<u8>, Error> {
     let contents = read_to_u8s(path)?;
-    let wasm = if wasm_preamble(&contents) {
+    let converted = if wasm_preamble(&contents) {
         contents
     } else {
-        wat2wasm(contents)?
+        wat2wasm(contents).map_err(|_| {
+            format_err!("Input is neither valid WASM nor WAT").context(LucetcErrorKind::Input)
+        })?
     };
-    let module_res = deserialize_buffer(&wasm);
-    module_res.map_err(|e| format_err!("deserializing wasm module: {}", e))
+    Ok(converted)
 }
 
 pub fn read_to_u8s<P: AsRef<Path>>(path: P) -> Result<Vec<u8>, Error> {

@@ -22,7 +22,8 @@ Lucet supports running WebAssembly programs written in C (via `clang`), Rust,
 and AssemblyScript. It does not yet support the entire WebAssembly spec, but
 full support is [coming in the near future](#lucet-spectest).
 
-Lucet's runtime currently only supports x86-64 based Linux systems.
+Lucet's runtime currently only supports x86-64 based Linux systems, with
+experimental support for macOS.
 
 ## Contents
 
@@ -156,16 +157,15 @@ Sightglass ships with a set of microbenchmarks called `shootout`. The scripts
 to build the shootout tests with native and various versions of the Lucet
 toolchain are in `/benchmarks/shootout`.
 
+Furthermore, there is a suite of benchmarks of various Lucet runtime functions,
+such as instance creation and teardown, in `/benchmarks/lucet-benchmarks`.
+
 ## Development Environment
 
 ### Operating System
 
-Lucet is developed and tested on Linux. We expect it to work on any POSIX
-system which supports ELF.
-
-Experimentally, we have shown that supporting Mac OS (which uses the Mach-O
-executable format instead of ELF) is possible, but it is not supported at this
-time.
+Lucet is developed and tested on Linux and macOS. We expect it to work on any
+POSIX system which supports shared libraries.
 
 ### Dependencies
 
@@ -175,31 +175,33 @@ Lucet requires:
 * [`wasi-sdk`](https://github.com/CraneStation/wasi-sdk), providing a Clang
   toolchain with wasm-ld, the WASI reference sysroot, and a libc based on WASI
   syscalls.
-* GNU Make, CMake, & various standard Unix utilities for the build system
-* `libhwloc`, for sightglass to pin benchmarks to a single core
+* GNU Make, CMake, & various standard Unix utilities for the build system.
 
 ### Getting started
 
 The easiest way to get started with the Lucet toolchain is by using the provided
 Docker-based development environment.
 
-This repository includes a `Dockerfile` to build a complete environement for
+This repository includes a `Dockerfile` to build a complete environment for
 compiling and running WebAssembly code with Lucet, but you shouldn't have to use
 Docker commands directly. A set of shell scripts with the `devenv_` prefix are
 used to manage the container.
 
 #### Setting up the environment
 
-1) Install and run the `docker` service. We do not support `podman` at this
+1) The Lucet repository uses git submodules. Make sure they are checked out
+   by running `git submodule init && git submodule update`.
+
+2) Install and run the `docker` service. We do not support `podman` at this
    time. On MacOS, [Docker for
    Mac](https://docs.docker.com/docker-for-mac/install/) is an option.
 
-2) Once Docker is running, in a terminal, and at the root of the cloned
+3) Once Docker is running, in a terminal, and at the root of the cloned
    repository, run: `source devenv_setenv.sh`. (This command requires the
    current shell to be `zsh`, `ksh` or `bash`). After a couple minutes, the
    Docker image is built and a new container is run.
 
-3) Check that new commands are now available:
+4) Check that new commands are now available:
 
 ```sh
 lucetc --help
@@ -237,12 +239,12 @@ int main(void)
 Time to compile to WebAssembly! The development environment includes a version
 of the Clang toolchain that is built to generate WebAssembly by default. The
 related commands are accessible from your current shell, and are prefixed by
-`wasm32-unknown-wasi-`.
+`wasm32-wasi-`.
 
 For example, to create a WebAssembly module `hello.wasm` from `hello.c`:
 
 ```sh
-wasm32-unknown-wasi-clang -Ofast -o hello.wasm hello.c
+wasm32-wasi-clang -Ofast -o hello.wasm hello.c
 ```
 
 The next step is to use Lucet to build native `x86_64` code from that
@@ -268,11 +270,137 @@ lucet-wasi hello.so
 * `./devenv_run.sh [<command>] [<arg>...]` runs a command in the container. If
   a command is not provided, an interactive shell is spawned. In this
   container, Lucet tools are installed in `/opt/lucet` by default. The command
-  `source /opt/lucet/bin/lucet_setenv.sh` can be used to initialize the
+  `source /opt/lucet/bin/devenv_setenv.sh` can be used to initialize the
   environment.
 * `./devenv_start.sh` and `./devenv_stop.sh` start and stop the container.
 
-## Reporting Security Issues
+### Compiling the toolchain without Docker
+
+Support for WebAssembly was introduced in LLVM 8, released in March 2019.
+
+As a result, Lucet can be compiled with an existing LLVM installation, provided
+that it is up to date.
+
+We successfully compiled it on macOS, Arch Linux and Ubuntu 19.04 using standard
+system packages.
+
+#### Compilation on Ubuntu 19.04
+
+On recent Ubuntu versions, the `cmake`, `clang` and `lld` packages must be
+installed:
+
+```sh
+apt install curl ca-certificates clang lld
+
+update-alternatives --install /usr/bin/wasm-ld wasm-ld /usr/bin/wasm-ld-8 100
+```
+
+In order to compile applications to WebAssembly, builtins need to be installed
+as well:
+
+```sh
+curl -sL https://github.com/CraneStation/wasi-sdk/releases/download/wasi-sdk-5/libclang_rt.builtins-wasm32-wasi-5.0.tar.gz | \
+sudo tar x -zf - -C /usr/lib/llvm-8/lib/clang/8.0.0
+```
+
+Install the latest stable version of the Rust compiler:
+
+```sh
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+source $HOME/.cargo/env
+```
+
+Fetch, compile and install the WASI sysroot:
+
+```sh
+git clone --recursive https://github.com/CraneStation/wasi-sysroot
+
+cd wasi-sysroot
+
+sudo make WASM_CC=clang-8 WASM_NM=llvm-nm-8 WASM_AR=llvm-ar-8 \
+  INSTALL_DIR=/opt/wasi-sysroot install
+
+cd - && sudo rm -fr wasi-sysroot
+```
+
+Enter the Lucet git repository clone, and fetch/update the submodules:
+
+```sh
+cd lucet
+
+git submodule update --init
+```
+
+Set relevant environment variables:
+
+```sh
+export WASI_SYSROOT=/opt/wasi-sysroot
+export CLANG_ROOT=/usr/lib/llvm-8/lib/clang/8.0.0
+export CLANG=clang-8
+```
+
+Finally, compile the toolchain:
+
+```sh
+cargo build --release
+```
+
+### Compilation on macOS
+
+Install `llvm`, `rust` and `cmake` using [Homebrew](https://brew.sh):
+
+```sh
+brew install llvm rust cmake
+```
+
+In order to compile applications to WebAssembly, builtins need to be installed
+as well:
+
+```sh
+curl -sL https://github.com/CraneStation/wasi-sdk/releases/download/wasi-sdk-5/libclang_rt.builtins-wasm32-wasi-5.0.tar.gz | \
+sudo tar x -zf - -C /usr/local/opt/llvm/lib/clang/8*
+```
+
+Fetch, compile and install the WASI sysroot:
+
+```sh
+git clone --recursive https://github.com/CraneStation/wasi-sysroot
+
+cd wasi-sysroot
+
+sudo env PATH=/usr/local/opt/llvm/bin:$PATH \
+  make INSTALL_DIR=/opt/wasi-sysroot install
+
+cd - && sudo rm -fr wasi-sysroot
+```
+
+Enter the Lucet git repository clone, and fetch/update the submodules:
+
+```sh
+cd lucet
+
+git submodule update --init
+```
+
+Set relevant environment variables:
+
+```sh
+export WASI_SYSROOT=/opt/wasi-sysroot
+export CLANG_ROOT="$(echo /usr/local/opt/llvm/lib/clang/8*)"
+export CLANG=/usr/local/opt/llvm/bin/clang
+```
+
+Finally, compile the toolchain:
+
+```sh
+cargo build --release
+```
+
+## Security
+
+The lucet project aims to provide support for secure execution of untrusted code. Security is achieved through a combination of lucet-supplied security controls and user-supplied security controls. See [SECURITY.md](SECURITY.md) for more information on the lucet security model.
+
+### Reporting Security Issues
 
 The Lucet project team welcomes security reports and is committed to providing
 prompt attention to security issues. Security issues should be reported

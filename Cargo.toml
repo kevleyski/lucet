@@ -8,9 +8,11 @@ members = [
   "lucet-runtime/lucet-runtime-tests",
   "lucet-spectest",
   "lucet-wasi",
+  "lucet-wasi-fuzz",
   "lucet-wasi-sdk",
   "lucetc",
   "sightglass",
+  "benchmarks/lucet-benchmarks",
 ]
 exclude = ["cranelift"]
 
@@ -18,4 +20,4 @@ exclude = ["cranelift"]
 rpath = true
 
 [replace]
-"faerie:0.9.1" = { path = "faerie" }
+"faerie:0.10.0" = { path = "faerie" }

@@ -9,6 +9,7 @@ license = "Apache-2.0 WITH LLVM-exception"
 cast = "0.2"
 clap = "2.23"
 failure = "0.1"
+human-size = "0.4"
 libc = "0.2"
 lucet-runtime = { path = "../lucet-runtime" }
 lucet-runtime-internals = { path = "../lucet-runtime/lucet-runtime-internals" }
@@ -28,6 +29,7 @@ name = "lucet_wasi"
 crate-type = ["rlib", "staticlib", "cdylib"]
 
 [package.metadata.deb]
+name = "fst-lucet-wasi"
 maintainer = "Adam C. Foltzer <acfoltzer@fastly.com>"
 depends = "$auto"
 priority = "optional"

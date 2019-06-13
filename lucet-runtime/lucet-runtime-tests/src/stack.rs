@@ -14,7 +14,7 @@ pub fn stack_testcase(num_locals: usize) -> Result<Arc<DlModule>, Error> {
     let mut wasm_file = File::create(&wasm_path)?;
     wasm_file.write_all(generate_test_wat(num_locals).as_bytes())?;
 
-    let native_build = Lucetc::new(wasm_path)?;
+    let native_build = Lucetc::new(wasm_path);
 
     let so_file = workdir.path().join("out.so");
 
@@ -84,7 +84,7 @@ fn generate_test_wat(num_locals: usize) -> String {
 macro_rules! stack_tests {
     ( $TestRegion:path ) => {
         use lucet_runtime::{
-            DlModule, Error, InstanceHandle, Limits, Region, TrapCodeType, UntypedRetVal, Val,
+            DlModule, Error, InstanceHandle, Limits, Region, TrapCode, UntypedRetVal, Val,
         };
         use std::sync::Arc;
         use $TestRegion as TestRegion;
@@ -96,7 +96,7 @@ macro_rules! stack_tests {
                 .new_instance(module)
                 .expect("instance can be created");
 
-            inst.run(b"localpalooza", &[recursion_depth.into()])
+            inst.run("localpalooza", &[recursion_depth.into()])
         }
 
         fn expect_ok(module: Arc<DlModule>, recursion_depth: i32) {
@@ -108,7 +108,7 @@ macro_rules! stack_tests {
                 Err(Error::RuntimeFault(details)) => {
                     // We should get a nonfatal trap due to the stack overflow.
                     assert_eq!(details.fatal, false);
-                    assert_eq!(details.trapcode.ty, TrapCodeType::StackOverflow);
+                    assert_eq!(details.trapcode, Some(TrapCode::StackOverflow));
                     if probestack {
                         // Make sure we overflowed in the stack probe as expected
                         //

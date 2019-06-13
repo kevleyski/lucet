@@ -1,14 +1,14 @@
 use failure::{Error, ResultExt};
-use lucet_wasi_sdk::Link;
-use lucetc::bindings::Bindings;
-use lucetc::load;
-use parity_wasm::elements::Module;
+use lucet_wasi_sdk::{CompileOpts, Link, LinkOpt, LinkOpts};
+use lucetc::Bindings;
 use std::collections::HashMap;
+use std::fs::File;
+use std::io::Read;
 use std::path::PathBuf;
 use std::str;
 use tempfile;
 
-fn module_from_c(cfiles: &[&str], exports: &[&str]) -> Result<Module, Error> {
+fn module_from_c(cfiles: &[&str], exports: &[&str]) -> Result<Vec<u8>, Error> {
     let cfiles: Vec<PathBuf> = cfiles
         .iter()
         .map(|ref name| PathBuf::from(format!("tests/wasi-sdk/{}.c", name)))
@@ -22,16 +22,18 @@ fn module_from_c(cfiles: &[&str], exports: &[&str]) -> Result<Module, Error> {
     wasm.push("out.wasm");
 
     let mut linker = Link::new(&cfiles)
-        .cflag("-nostartfiles")
-        .ldflag("--no-entry")
-        .ldflag("--allow-undefined");
+        .with_cflag("-nostartfiles")
+        .with_link_opt(LinkOpt::NoDefaultEntryPoint)
+        .with_link_opt(LinkOpt::AllowUndefinedAll);
     for export in exports {
-        linker.with_ldflag(&format!("--export={}", export));
+        linker.export(export);
     }
     linker.link(wasm.clone())?;
 
-    let m = load::read_module(&wasm).context(format!("loading module built from {:?}", cfiles))?;
-    Ok(m)
+    let mut wasm_file = File::open(wasm)?;
+    let mut wasm_contents = Vec::new();
+    wasm_file.read_to_end(&mut wasm_contents)?;
+    Ok(wasm_contents)
 }
 
 fn b_only_test_bindings() -> Bindings {
@@ -47,50 +49,49 @@ fn b_only_test_bindings() -> Bindings {
 
 mod programs {
     use super::{b_only_test_bindings, module_from_c};
-    use cranelift_module::Linkage;
-    use lucetc::bindings::Bindings;
-    use lucetc::compile;
-    use lucetc::compiler::OptLevel;
-    use lucetc::program::{HeapSettings, Program};
-
-    fn num_import_globals(p: &Program) -> usize {
-        p.globals()
-            .iter()
-            .filter_map(|g| g.as_import())
-            .collect::<Vec<_>>()
-            .len()
-    }
-
-    fn num_export_functions(p: &Program) -> usize {
-        p.defined_functions()
-            .iter()
-            .filter(|f| f.linkage() == Linkage::Export)
-            .collect::<Vec<_>>()
-            .len()
-    }
+    use lucetc::{Bindings, Compiler, HeapSettings, OptLevel};
 
     #[test]
     fn empty() {
         let m = module_from_c(&["empty"], &[]).expect("build module for empty");
         let b = Bindings::empty();
         let h = HeapSettings::default();
-        let p = Program::new(m, b, h).expect("create program for empty");
-        assert_eq!(p.import_functions().len(), 0, "import functions");
+        let c = Compiler::new(&m, OptLevel::Fast, &b, h).expect("compile empty");
+        let mdata = c.module_data().unwrap();
+        assert!(mdata.heap_spec().is_some());
+        // clang creates 3 globals:
+        assert_eq!(mdata.globals_spec().len(), 3);
+        assert!(mdata.globals_spec()[0].is_internal());
+        assert_eq!(mdata.globals_spec()[1].export_names(), &["__heap_base"]);
+        assert_eq!(mdata.globals_spec()[2].export_names(), &["__data_end"]);
+
+        assert_eq!(mdata.import_functions().len(), 0, "import functions");
+        assert_eq!(mdata.export_functions().len(), 0, "export functions");
+
+        /* FIXME: module data doesn't contain the information to check these properties:
         assert_eq!(num_import_globals(&p), 0, "import globals");
-        assert_eq!(num_export_functions(&p), 0, "export functions");
-        let _c = compile(&p, "empty".into(), OptLevel::Best).expect("compile empty");
+        */
+
+        let _obj = c.object_file().expect("generate code from empty");
     }
 
     #[test]
     fn just_a() {
         let m = module_from_c(&["a"], &["a"]).expect("build module for a");
+
         let b = Bindings::empty();
         let h = HeapSettings::default();
-        let p = Program::new(m, b, h).expect("create program for a");
-        assert_eq!(p.import_functions().len(), 0, "import functions");
+        let c = Compiler::new(&m, OptLevel::Fast, &b, h).expect("compile a");
+        let mdata = c.module_data().unwrap();
+
+        assert_eq!(mdata.import_functions().len(), 0, "import functions");
+        assert_eq!(mdata.export_functions().len(), 1, "export functions");
+
+        /* FIXME: module data doesn't contain the information to check these properties:
         assert_eq!(num_import_globals(&p), 0, "import globals");
-        assert_eq!(num_export_functions(&p), 1, "export functions");
-        let _c = compile(&p, "a_only".into(), OptLevel::Best).expect("compile a");
+        */
+
+        let _obj = c.object_file().expect("generate code from a");
     }
 
     #[test]
@@ -98,11 +99,15 @@ mod programs {
         let m = module_from_c(&["b"], &["b"]).expect("build module for b");
         let b = b_only_test_bindings();
         let h = HeapSettings::default();
-        let p = Program::new(m, b, h).expect("create program for b");
-        assert_eq!(p.import_functions().len(), 1, "import functions");
+        let c = Compiler::new(&m, OptLevel::Fast, &b, h).expect("compile b");
+        let mdata = c.module_data().unwrap();
+        assert_eq!(mdata.import_functions().len(), 1, "import functions");
+        assert_eq!(mdata.export_functions().len(), 1, "export functions");
+
+        /* FIXME: module data doesn't contain the information to check these properties:
         assert_eq!(num_import_globals(&p), 0, "import globals");
-        assert_eq!(num_export_functions(&p), 1, "export functions");
-        let _c = compile(&p, "b_only".into(), OptLevel::Best).expect("compile b");
+        */
+        let _obj = c.object_file().expect("generate code from b");
     }
 
     #[test]
@@ -110,11 +115,15 @@ mod programs {
         let m = module_from_c(&["a", "b"], &["a", "b"]).expect("build module for a & b");
         let b = Bindings::empty();
         let h = HeapSettings::default();
-        let p = Program::new(m, b, h).expect("create program for a & b");
-        assert_eq!(p.import_functions().len(), 0, "import functions");
+        let c = Compiler::new(&m, OptLevel::Fast, &b, h).expect("compile a & b");
+        let mdata = c.module_data().unwrap();
+        assert_eq!(mdata.import_functions().len(), 0, "import functions");
+        assert_eq!(mdata.export_functions().len(), 2, "export functions");
+
+        /* FIXME: module data doesn't contain the information to check these properties:
         assert_eq!(num_import_globals(&p), 0, "import globals");
-        assert_eq!(num_export_functions(&p), 2, "export functions");
-        let _c = compile(&p, "a_and_b".into(), OptLevel::Best).expect("compile a & b");
+        */
+        let _obj = c.object_file().expect("generate code from a & b");
     }
 
 }

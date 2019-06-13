@@ -53,7 +53,7 @@
 //! let region = MmapRegion::create(1, &Limits::default()).unwrap();
 //! let mut inst = region.new_instance(module).unwrap();
 //!
-//! let retval = inst.run(b"factorial", &[5u64.into()]).unwrap();
+//! let retval = inst.run("factorial", &[5u64.into()]).unwrap();
 //! assert_eq!(u64::from(retval), 120u64);
 //! ```
 //!
@@ -65,23 +65,26 @@
 //! demo](https://wasm.fastly-labs.com/), hostcalls are provided for manipulating HTTP requests,
 //! accessing a key/value store, etc.
 //!
-//! Some simple hostcalls can be implemented simply as an exported C function that takes an opaque
-//! pointer argument (usually called `vmctx`). Hostcalls that require access to some underlying
-//! state, such as the key/value store in Terrarium, can access a custom embedder context through
-//! `vmctx`. For example, to make a `u32` available to hostcalls:
+//! Some simple hostcalls can be implemented by wrapping an externed C function with the
+//! [`lucet_hostcalls!`](macro.lucet_hostcalls.html] macro. The function must take a special `&mut
+//! vmctx` argument for the guest context, similar to `&mut self` on methods. Hostcalls that require
+//! access to some underlying state, such as the key/value store in Terrarium, can access a custom
+//! embedder context through `vmctx`. For example, to make a `u32` available to hostcalls:
 //!
 //! ```no_run
-//! use lucet_runtime::{DlModule, Limits, MmapRegion, Region};
+//! use lucet_runtime::{DlModule, Limits, MmapRegion, Region, lucet_hostcalls};
 //! use lucet_runtime::vmctx::{Vmctx, lucet_vmctx};
 //!
 //! struct MyContext { x: u32 }
 //!
-//! #[no_mangle]
-//! unsafe extern "C" fn foo(vmctx: *mut lucet_vmctx) {
-//!     let mut vmctx = Vmctx::from_raw(vmctx);
-//!     let hostcall_context = vmctx
-//!         .get_embed_ctx_mut::<MyContext>();
-//!     hostcall_context.x = 42;
+//! lucet_hostcalls! {
+//!     #[no_mangle]
+//!     pub unsafe extern "C" fn foo(
+//!         &mut vmctx,
+//!     ) -> () {
+//!         let mut hostcall_context = vmctx.get_embed_ctx_mut::<MyContext>();
+//!         hostcall_context.x = 42;
+//!     }
 //! }
 //!
 //! let module = DlModule::load("/my/lucet/module.so").unwrap();
@@ -92,9 +95,9 @@
 //!     .build()
 //!     .unwrap();
 //!
-//! inst.run(b"call_foo", &[]).unwrap();
+//! inst.run("call_foo", &[]).unwrap();
 //!
-//! let context_after = inst.get_embed_ctx::<MyContext>().unwrap();
+//! let context_after = inst.get_embed_ctx::<MyContext>().unwrap().unwrap();
 //! assert_eq!(context_after.x, 42);
 //! ```
 //!
@@ -121,7 +124,7 @@
 //!     .build()
 //!     .unwrap();
 //!
-//! inst.run(b"main", &[]).unwrap();
+//! inst.run("main", &[]).unwrap();
 //!
 //! // clean up embedder context
 //! drop(inst);
@@ -144,7 +147,7 @@
 //!
 //! ```no_run
 //! use lucet_runtime::{
-//!     DlModule, Error, Instance, Limits, MmapRegion, Region, SignalBehavior, TrapCode
+//!     DlModule, Error, Instance, Limits, MmapRegion, Region, SignalBehavior, TrapCode,
 //! };
 //! use std::sync::atomic::{AtomicUsize, Ordering, ATOMIC_USIZE_INIT};
 //!
@@ -152,7 +155,7 @@
 //!
 //! fn signal_handler_count(
 //!     _inst: &Instance,
-//!     _trapcode: &TrapCode,
+//!     _trapcode: &Option<TrapCode>,
 //!     _signum: libc::c_int,
 //!     _siginfo_ptr: *const libc::siginfo_t,
 //!     _ucontext_ptr: *const libc::c_void,
@@ -168,7 +171,7 @@
 //! // install the handler
 //! inst.set_signal_handler(signal_handler_count);
 //!
-//! match inst.run(b"raise_a_signal", &[]) {
+//! match inst.run("raise_a_signal", &[]) {
 //!     Err(Error::RuntimeFault(_)) => {
 //!         println!("I've now handled {} signals!", SIGNAL_COUNT.load(Ordering::SeqCst));
 //!     }
@@ -195,8 +198,9 @@
 //! that, for example, a `SIGSEGV` on a non-Lucet thread of a host program will still likely abort
 //! the entire process.
 
-mod c_api;
+pub mod c_api;
 
+pub use lucet_module_data::TrapCode;
 pub use lucet_runtime_internals::alloc::Limits;
 pub use lucet_runtime_internals::error::Error;
 pub use lucet_runtime_internals::instance::{
@@ -204,10 +208,9 @@ pub use lucet_runtime_internals::instance::{
 };
 pub use lucet_runtime_internals::module::{DlModule, Module};
 pub use lucet_runtime_internals::region::mmap::MmapRegion;
-pub use lucet_runtime_internals::region::{InstanceBuilder, Region};
-pub use lucet_runtime_internals::trapcode::{TrapCode, TrapCodeType};
+pub use lucet_runtime_internals::region::{InstanceBuilder, Region, RegionCreate};
 pub use lucet_runtime_internals::val::{UntypedRetVal, Val};
-pub use lucet_runtime_internals::WASM_PAGE_SIZE;
+pub use lucet_runtime_internals::{lucet_hostcall_terminate, lucet_hostcalls, WASM_PAGE_SIZE};
 
 pub mod vmctx {
     //! Functions for manipulating instances from hostcalls.

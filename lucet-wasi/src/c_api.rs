@@ -37,12 +37,21 @@ pub unsafe extern "C" fn lucet_wasi_ctx_args(
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn lucet_wasi_ctx_inherit_env(
+pub unsafe extern "C" fn lucet_wasi_ctx_inherit_env(wasi_ctx: *mut lucet_wasi_ctx) -> lucet_error {
+    assert_nonnull!(wasi_ctx);
+    let mut b = Box::from_raw(wasi_ctx as *mut WasiCtxBuilder);
+    *b = b.inherit_env();
+    Box::into_raw(b);
+    lucet_error::Ok
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn lucet_wasi_ctx_inherit_stdio(
     wasi_ctx: *mut lucet_wasi_ctx,
 ) -> lucet_error {
     assert_nonnull!(wasi_ctx);
     let mut b = Box::from_raw(wasi_ctx as *mut WasiCtxBuilder);
-    *b = b.inherit_env();
+    *b = b.inherit_stdio();
     Box::into_raw(b);
     lucet_error::Ok
 }
@@ -77,7 +86,6 @@ pub unsafe extern "C" fn lucet_region_new_instance_with_wasi_ctx(
             .unwrap_or_else(|e| e.into())
     })
 }
-
 
 /// Call this if you're having trouble with `__wasi_*` symbols not being exported.
 ///

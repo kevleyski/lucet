@@ -2,10 +2,11 @@ use crate::error::Error;
 use crate::module::Module;
 use crate::region::RegionInternal;
 use libc::{c_void, SIGSTKSZ};
+use lucet_module_data::GlobalValue;
 use nix::unistd::{sysconf, SysconfVar};
 use std::sync::{Arc, Once, Weak};
 
-const HOST_PAGE_SIZE_EXPECTED: usize = 4096;
+pub const HOST_PAGE_SIZE_EXPECTED: usize = 4096;
 static mut HOST_PAGE_SIZE: usize = 0;
 static HOST_PAGE_SIZE_INIT: Once = Once::new();
 
@@ -154,25 +155,27 @@ impl Alloc {
         // the above makes sure this expression does not underflow
         let guard_remaining = self.heap_inaccessible_size - expand_pagealigned as usize;
 
-        let heap_spec = module.heap_spec();
-        // The compiler specifies how much guard (memory which traps on access) must be beyond the
-        // end of the accessible memory. We cannot perform an expansion that would make this region
-        // smaller than the compiler expected it to be.
-        if guard_remaining < heap_spec.guard_size as usize {
-            bail_limits_exceeded!("expansion would leave guard memory too small");
-        }
-
-        // The compiler indicates that the module has specified a maximum memory size. Don't let
-        // the heap expand beyond that:
-        if let Some(max_size) = heap_spec.max_size {
-            if self.heap_accessible_size + expand_pagealigned as usize > max_size as usize {
-                bail_limits_exceeded!(
-                    "expansion would exceed module-specified heap limit: {:?}",
-                    max_size
-                );
+        if let Some(heap_spec) = module.heap_spec() {
+            // The compiler specifies how much guard (memory which traps on access) must be beyond the
+            // end of the accessible memory. We cannot perform an expansion that would make this region
+            // smaller than the compiler expected it to be.
+            if guard_remaining < heap_spec.guard_size as usize {
+                bail_limits_exceeded!("expansion would leave guard memory too small");
             }
-        }
 
+            // The compiler indicates that the module has specified a maximum memory size. Don't let
+            // the heap expand beyond that:
+            if let Some(max_size) = heap_spec.max_size {
+                if self.heap_accessible_size + expand_pagealigned as usize > max_size as usize {
+                    bail_limits_exceeded!(
+                        "expansion would exceed module-specified heap limit: {:?}",
+                        max_size
+                    );
+                }
+            }
+        } else {
+            return Err(Error::NoLinearMemory("cannot expand heap".to_owned()));
+        }
         // The runtime sets a limit on how much of the heap can be backed by real memory. Don't let
         // the heap expand beyond that:
         if self.heap_accessible_size + expand_pagealigned as usize > slot.limits.heap_memory_size {
@@ -288,18 +291,18 @@ impl Alloc {
     }
 
     /// Return the globals as a slice.
-    pub unsafe fn globals(&self) -> &[i64] {
+    pub unsafe fn globals(&self) -> &[GlobalValue] {
         std::slice::from_raw_parts(
-            self.slot().globals as *const i64,
-            self.slot().limits.globals_size / 8,
+            self.slot().globals as *const GlobalValue,
+            self.slot().limits.globals_size / std::mem::size_of::<GlobalValue>(),
         )
     }
 
     /// Return the globals as a mutable slice.
-    pub unsafe fn globals_mut(&mut self) -> &mut [i64] {
+    pub unsafe fn globals_mut(&mut self) -> &mut [GlobalValue] {
         std::slice::from_raw_parts_mut(
-            self.slot().globals as *mut i64,
-            self.slot().limits.globals_size / 8,
+            self.slot().globals as *mut GlobalValue,
+            self.slot().limits.globals_size / std::mem::size_of::<GlobalValue>(),
         )
     }
 
@@ -386,6 +389,11 @@ impl Limits {
         if self.heap_address_space_size % host_page_size() != 0 {
             return Err(Error::InvalidArgument(
                 "address space size must be a multiple of host page size",
+            ));
+        }
+        if self.heap_memory_size > self.heap_address_space_size {
+            return Err(Error::InvalidArgument(
+                "address space size must be at least as large as memory size",
             ));
         }
         if self.stack_size % host_page_size() != 0 {

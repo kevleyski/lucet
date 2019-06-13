@@ -1,14 +1,15 @@
-extern crate lucet_runtime_internals;
-
-use crate::{DlModule, Instance, Limits, MmapRegion, Module, Region, TrapCode};
+use crate::{DlModule, Instance, Limits, MmapRegion, Module, Region};
 use libc::{c_char, c_int, c_void};
+use lucet_module_data::TrapCode;
 use lucet_runtime_internals::c_api::*;
 use lucet_runtime_internals::instance::{
     instance_handle_from_raw, instance_handle_to_raw, InstanceInternal,
 };
-use lucet_runtime_internals::vmctx::{instance_from_vmctx, lucet_vmctx, Vmctx, VmctxInternal};
+use lucet_runtime_internals::vmctx::VmctxInternal;
 use lucet_runtime_internals::WASM_PAGE_SIZE;
-use lucet_runtime_internals::{assert_nonnull, with_ffi_arcs};
+use lucet_runtime_internals::{
+    assert_nonnull, lucet_hostcall_terminate, lucet_hostcalls, with_ffi_arcs,
+};
 use num_traits::FromPrimitive;
 use std::ffi::CStr;
 use std::ptr;
@@ -39,6 +40,7 @@ pub extern "C" fn lucet_error_name(e: c_int) -> *const c_char {
             RegionFull => "lucet_error_region_full\0".as_ptr() as _,
             Module => "lucet_error_module\0".as_ptr() as _,
             LimitsExceeded => "lucet_error_limits_exceeded\0".as_ptr() as _,
+            NoLinearMemory => "lucet_error_no_linear_memory\0".as_ptr() as _,
             SymbolNotFound => "lucet_error_symbol_not_found\0".as_ptr() as _,
             FuncNotFound => "lucet_error_func_not_found\0".as_ptr() as _,
             RuntimeFault => "lucet_error_runtime_fault\0".as_ptr() as _,
@@ -163,9 +165,15 @@ pub unsafe extern "C" fn lucet_instance_run(
             .map(|v| v.into())
             .collect()
     };
+    let entrypoint = match CStr::from_ptr(entrypoint).to_str() {
+        Ok(entrypoint_str) => entrypoint_str,
+        Err(_) => {
+            return lucet_error::SymbolNotFound;
+        }
+    };
+
     with_instance_ptr!(inst, {
-        let entrypoint = CStr::from_ptr(entrypoint);
-        inst.run(entrypoint.to_bytes(), args.as_slice())
+        inst.run(entrypoint, args.as_slice())
             .map(|_| lucet_error::Ok)
             .unwrap_or_else(|e| {
                 eprintln!("{}", e);
@@ -237,7 +245,7 @@ pub unsafe extern "C" fn lucet_instance_reset(inst: *mut lucet_instance) -> luce
 
 #[no_mangle]
 pub unsafe extern "C" fn lucet_instance_release(inst: *mut lucet_instance) {
-    instance_handle_from_raw(inst as *mut Instance);
+    instance_handle_from_raw(inst as *mut Instance, true);
 }
 
 #[no_mangle]
@@ -282,7 +290,7 @@ pub unsafe extern "C" fn lucet_instance_grow_heap(
 pub unsafe extern "C" fn lucet_instance_embed_ctx(inst: *mut lucet_instance) -> *mut c_void {
     with_instance_ptr_unchecked!(inst, {
         inst.get_embed_ctx::<*mut c_void>()
-            .map(|p| *p)
+            .map(|r| r.map(|p| *p).unwrap_or(ptr::null_mut()))
             .unwrap_or(ptr::null_mut())
     })
 }
@@ -293,7 +301,7 @@ pub unsafe extern "C" fn lucet_instance_set_signal_handler(
     inst: *mut lucet_instance,
     signal_handler: lucet_signal_handler,
 ) -> lucet_error {
-    let handler = move |inst: &Instance, trap: &TrapCode, signum, siginfo, context| {
+    let handler = move |inst: &Instance, trap: &Option<TrapCode>, signum, siginfo, context| {
         let inst = inst as *const Instance as *mut lucet_instance;
         let trap = trap.into();
         let trap_ptr = &trap as *const lucet_state::lucet_trapcode;
@@ -361,76 +369,85 @@ pub fn ensure_linked() {
     });
 }
 
-#[no_mangle]
-pub unsafe extern "C" fn lucet_vmctx_get_heap(vmctx: *mut lucet_vmctx) -> *mut u8 {
-    Vmctx::from_raw(vmctx).instance().alloc().slot().heap as *mut u8
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn lucet_vmctx_get_globals(vmctx: *mut lucet_vmctx) -> *mut i64 {
-    Vmctx::from_raw(vmctx).instance().alloc().slot().globals as *mut i64
-}
-
-/// Get the number of WebAssembly pages currently in the heap.
-#[no_mangle]
-pub unsafe extern "C" fn lucet_vmctx_current_memory(vmctx: *mut lucet_vmctx) -> libc::uint32_t {
-    Vmctx::from_raw(vmctx).instance().alloc().heap_len() as u32 / WASM_PAGE_SIZE
-}
-
-#[no_mangle]
-/// Grows the guest heap by the given number of WebAssembly pages.
-///
-/// On success, returns the number of pages that existed before the call. On failure, returns `-1`.
-pub unsafe extern "C" fn lucet_vmctx_grow_memory(
-    vmctx: *mut lucet_vmctx,
-    additional_pages: libc::uint32_t,
-) -> libc::int32_t {
-    let inst = instance_from_vmctx(vmctx);
-    if let Ok(old_pages) = inst.grow_memory(additional_pages) {
-        old_pages as libc::int32_t
-    } else {
-        -1
+lucet_hostcalls! {
+    #[no_mangle]
+    pub unsafe extern "C" fn lucet_vmctx_get_heap(
+        &mut vmctx,
+    ) -> *mut u8 {
+        vmctx.instance().alloc().slot().heap as *mut u8
     }
-}
 
-#[no_mangle]
-/// Check if a memory region is inside the instance heap.
-pub unsafe extern "C" fn lucet_vmctx_check_heap(
-    vmctx: *mut lucet_vmctx,
-    ptr: *mut c_void,
-    len: libc::size_t,
-) -> bool {
-    let inst = instance_from_vmctx(vmctx);
-    inst.check_heap(ptr, len)
-}
+    #[no_mangle]
+    pub unsafe extern "C" fn lucet_vmctx_get_globals(
+        &mut vmctx,
+    ) -> *mut i64 {
+        vmctx.instance().alloc().slot().globals as *mut i64
+    }
 
-#[no_mangle]
-pub unsafe extern "C" fn lucet_vmctx_get_func_from_idx(
-    vmctx: *mut lucet_vmctx,
-    table_idx: u32,
-    func_idx: u32,
-) -> *const c_void {
-    let inst = instance_from_vmctx(vmctx);
-    inst.module()
-        .get_func_from_idx(table_idx, func_idx)
-        // the Rust API actually returns a pointer to a function pointer, so we want to dereference
-        // one layer of that to make it nicer in C
-        .map(|fptr| *(fptr as *const *const c_void))
-        .unwrap_or(std::ptr::null())
-}
+    #[no_mangle]
+    /// Get the number of WebAssembly pages currently in the heap.
+    pub unsafe extern "C" fn lucet_vmctx_current_memory(
+        &mut vmctx,
+    ) -> libc::uint32_t {
+        vmctx.instance().alloc().heap_len() as u32 / WASM_PAGE_SIZE
+    }
 
-#[no_mangle]
-pub unsafe extern "C" fn lucet_vmctx_terminate(vmctx: *mut lucet_vmctx, info: *mut c_void) {
-    Vmctx::from_raw(vmctx).terminate(info);
-}
+    #[no_mangle]
+    /// Grows the guest heap by the given number of WebAssembly pages.
+    ///
+    /// On success, returns the number of pages that existed before the call. On failure, returns `-1`.
+    pub unsafe extern "C" fn lucet_vmctx_grow_memory(
+        &mut vmctx,
+        additional_pages: libc::uint32_t,
+    ) -> libc::int32_t {
+        if let Ok(old_pages) = vmctx.instance_mut().grow_memory(additional_pages) {
+            old_pages as libc::int32_t
+        } else {
+            -1
+        }
+    }
 
-#[no_mangle]
-/// Get the delegate object for the current instance.
-///
-/// TODO: rename
-pub unsafe extern "C" fn lucet_vmctx_get_delegate(vmctx: *mut lucet_vmctx) -> *mut c_void {
-    let inst = instance_from_vmctx(vmctx);
-    inst.get_embed_ctx::<*mut c_void>()
-        .map(|p| *p)
-        .unwrap_or(std::ptr::null_mut())
+    #[no_mangle]
+    /// Check if a memory region is inside the instance heap.
+    pub unsafe extern "C" fn lucet_vmctx_check_heap(
+        &mut vmctx,
+        ptr: *mut c_void,
+        len: libc::size_t,
+    ) -> bool {
+        vmctx.instance().check_heap(ptr, len)
+    }
+
+    #[no_mangle]
+    pub unsafe extern "C" fn lucet_vmctx_get_func_from_idx(
+        &mut vmctx,
+        table_idx: u32,
+        func_idx: u32,
+    ) -> *const c_void {
+        vmctx.instance()
+            .module()
+            .get_func_from_idx(table_idx, func_idx)
+            .map(|fptr| fptr.ptr.as_usize() as *const c_void)
+            .unwrap_or(std::ptr::null())
+    }
+
+    #[no_mangle]
+    pub unsafe extern "C" fn lucet_vmctx_terminate(
+        &mut _vmctx,
+        details: *mut c_void,
+    ) -> () {
+        lucet_hostcall_terminate!(CTerminationDetails { details});
+    }
+
+    #[no_mangle]
+    /// Get the delegate object for the current instance.
+    ///
+    /// TODO: rename
+    pub unsafe extern "C" fn lucet_vmctx_get_delegate(
+        &mut vmctx,
+    ) -> *mut c_void {
+        vmctx.instance()
+            .get_embed_ctx::<*mut c_void>()
+            .map(|r| r.map(|p| *p).unwrap_or(ptr::null_mut()))
+            .unwrap_or(std::ptr::null_mut())
+    }
 }

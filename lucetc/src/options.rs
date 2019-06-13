@@ -36,6 +36,8 @@ pub struct Options {
     pub codegen: CodegenOutput,
     pub binding_files: Vec<PathBuf>,
     pub builtins_path: Option<PathBuf>,
+    pub min_reserved_size: Option<u64>,
+    pub max_reserved_size: Option<u64>,
     pub reserved_size: Option<u64>,
     pub guard_size: Option<u64>,
     pub opt_level: OptLevel,
@@ -67,6 +69,18 @@ impl Options {
 
         let builtins_path = m.value_of("builtins").map(PathBuf::from);
 
+        let min_reserved_size = if let Some(min_reserved_str) = m.value_of("min_reserved_size") {
+            Some(parse_humansized(min_reserved_str)?)
+        } else {
+            None
+        };
+
+        let max_reserved_size = if let Some(max_reserved_str) = m.value_of("max_reserved_size") {
+            Some(parse_humansized(max_reserved_str)?)
+        } else {
+            None
+        };
+
         let reserved_size = if let Some(reserved_str) = m.value_of("reserved_size") {
             Some(parse_humansized(reserved_str)?)
         } else {
@@ -80,10 +94,10 @@ impl Options {
         };
 
         let opt_level = match m.value_of("opt_level") {
-            None => OptLevel::Default,
-            Some("default") => OptLevel::Default,
-            Some("best") => OptLevel::Best,
-            Some("fastest") => OptLevel::Fastest,
+            None => OptLevel::default(),
+            Some("0") => OptLevel::None,
+            Some("1") => OptLevel::Standard,
+            Some("2") | Some("fast") => OptLevel::Fast,
             Some(_) => panic!("unknown value for opt-level"),
         };
 
@@ -93,6 +107,8 @@ impl Options {
             codegen,
             binding_files,
             builtins_path,
+            min_reserved_size,
+            max_reserved_size,
             reserved_size,
             guard_size,
             opt_level,
@@ -116,6 +132,7 @@ impl Options {
             .arg(
                 Arg::with_name("output")
                     .short("o")
+                    .long("output")
                     .takes_value(true)
                     .multiple(false)
                     .help("output destination, defaults to a.out if unspecified"),
@@ -125,17 +142,32 @@ impl Options {
                     .long("--bindings")
                     .takes_value(true)
                     .multiple(true)
+                    .number_of_values(1)
                     .help("path to bindings json file"),
+            )
+            .arg(
+                Arg::with_name("min_reserved_size")
+                    .long("--min-reserved-size")
+                    .takes_value(true)
+                    .multiple(false)
+                    .help(&format!(
+                        "minimum size of usable linear memory region. must be multiple of 4k. default: {}",
+                        humansized(HeapSettings::default().min_reserved_size)
+                    )),
+            )
+            .arg(
+                Arg::with_name("max_reserved_size")
+                    .long("--max-reserved-size")
+                    .takes_value(true)
+                    .multiple(false)
+                    .help("maximum size of usable linear memory region. must be multiple of 4k. default: 4 GiB"),
             )
             .arg(
                 Arg::with_name("reserved_size")
                     .long("--reserved-size")
                     .takes_value(true)
                     .multiple(false)
-                    .help(&format!(
-                        "size of usable linear memory region. must be multiple of 4k. default: {}",
-                        humansized(HeapSettings::default().reserved_size)
-                    )),
+                    .help("exact size of usable linear memory region, overriding --{min,max}-reserved-size. must be multiple of 4k"),
             )
             .arg(
                 Arg::with_name("guard_size")
@@ -163,8 +195,8 @@ impl Options {
                 Arg::with_name("opt_level")
                     .long("--opt-level")
                     .takes_value(true)
-                    .possible_values(&["default", "fastest", "best"])
-                    .help("optimization level (default: 'default')"),
+                    .possible_values(&["0", "1", "2", "fast"])
+                    .help("optimization level (default: '1')"),
             )
             .get_matches();
 
